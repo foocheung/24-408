@@ -1,0 +1,384 @@
+---
+title: "Connors Batch2 (24-408-2): TCR repertoire and CD8 T-cell composition"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+---
+
+Reads tables written by the analysis script from the `ANALYSIS` folder. The saved Seurat object is used for the TCR chain-recovery breakdown and UMAP. The report focuses on:
+
+1. TCR clonotype counts, frequencies, and clonal expansion by donor.
+2. TCR chain recovery: why some SingleR T cells lack a usable paired TRA/TRB.
+3. Cell-type composition and CD8 T-cell enrichment.
+
+**Doublet filtering:** Donors were assigned using Demuxalot, and cross-donor SNP doublets were excluded from the TCR repertoire analysis. Doublet detection was evaluated separately using Demuxalot, Vireo, DoubletDetection, scDblFinder, scds, and scrublet; the accompanying UpSet plot summarizes agreement between methods. The UpSet plot shows agreement, not which method is most accurate, and same-donor doublets may remain among SNP singlets.
+
+Supporting figures: QC violin plots before and after filtering, and a UMAP of the cell types.
+
+```{r setup}
+library(readr); library(tidyr); library(dplyr); library(ggplot2)
+
+analysis_dir <- "ANALYSIS"
+top_n <- 10
+runid <- "24-408-2_Connors_Batch2"
+rds_file <- file.path(analysis_dir, paste0(runid, "_Demuxalot_SingleR_Seurat.rds"))   # only used for the UMAP
+rd  <- function(f) read_tsv(file.path(analysis_dir, f), show_col_types = FALSE)
+kab <- function(x, ...) knitr::kable(x, digits = 2, format.args = list(big.mark = ","), ...)
+
+# Monaco fine labels -> lineage
+lineage <- function(x) case_when(
+  grepl("CD8 T", x)                                    ~ "CD8 T",
+  grepl("CD4 T|Th[0-9]|T regulatory|Follicular", x)    ~ "CD4 T",
+  grepl("MAIT|gd T|Vd2", x)                            ~ "Other T (MAIT/gd)",
+  grepl("NK|Natural killer", x)                        ~ "NK",
+  grepl("B cells|Plasmablast", x)                      ~ "B / plasma",
+  grepl("monocyte|dendritic|neutrophil|basophil", x, ignore.case = TRUE) ~ "Myeloid",
+  grepl("Progenitor", x)                               ~ "Progenitor",
+  TRUE                                                 ~ "Other")
+t_lineages <- c("CD8 T", "CD4 T", "Other T (MAIT/gd)")
+
+# nucleotide CDR3 -> amino acids, so clonotypes are readable
+bases <- c("T", "C", "A", "G")
+g <- expand.grid(third = bases, second = bases, first = bases, stringsAsFactors = FALSE)
+codon_aa <- setNames(
+  strsplit("FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", "")[[1]],
+  paste0(g$first, g$second, g$third))
+translate_nt <- function(s) vapply(s, function(x) {
+  n <- nchar(x) %/% 3
+  if (n == 0) return("")
+  cod <- substring(x, seq(1, by = 3, length.out = n), seq(3, by = 3, length.out = n))
+  paste(codon_aa[cod], collapse = "")
+}, character(1), USE.NAMES = FALSE)
+clono_aa <- function(x) vapply(strsplit(x, "|", fixed = TRUE),
+  function(v) paste0("TRA:", translate_nt(v[1]), " TRB:", translate_nt(v[2])), character(1))
+```
+
+# QC filtering: before and after
+
+Violin plots of the standard per-cell QC metrics for every barcode in the GEX matrix (before) and for the cells kept for analysis (after). The kept cells are SNP singlets with 200 to 5,000 genes, at least 500 UMIs, and at most 15% mitochondrial reads, the same thresholds as the analysis script. Dashed red lines mark the thresholds. Ribosomal content is not filtered because T cells naturally have a high ribosomal fraction.
+
+```{r qc-data}
+min_features <- 200; max_features <- 5000; min_counts <- 500; max_mt <- 15   # must match the analysis script
+
+qc <- rd("all_cells_QC_demux.tsv") %>% rename(percent_mt = `percent.mt`)
+qc_after <- qc %>%
+  filter(snp_status == "singlet",
+         nFeature_RNA >= min_features, nFeature_RNA <= max_features,
+         nCount_RNA >= min_counts, percent_mt <= max_mt)
+
+# sequential filters, so each row shows what that step removed
+s1 <- qc %>% filter(snp_status == "singlet")
+s2 <- s1 %>% filter(nFeature_RNA >= min_features, nFeature_RNA <= max_features)
+s3 <- s2 %>% filter(nCount_RNA >= min_counts)
+s4 <- s3 %>% filter(percent_mt <= max_mt)
+tibble(step = c("All barcodes in the GEX matrix", "SNP singlets (not doublet / unassigned)",
+                "nFeature_RNA within 200-5,000", "nCount_RNA at least 500", "percent.mt at most 15"),
+       cells = c(nrow(qc), nrow(s1), nrow(s2), nrow(s3), nrow(s4))) %>%
+  mutate(removed = lag(cells) - cells) %>%
+  kab(caption = "Cells remaining after each step")
+
+n_expected <- sum(rd("celltype_composition_by_donor.tsv")$n_cells)
+cat(sprintf("Cells kept here: %s | cells in the analysed object: %s%s\n",
+            format(nrow(qc_after), big.mark = ","), format(n_expected, big.mark = ","),
+            if (nrow(qc_after) == n_expected) " (match)" else " (MISMATCH: thresholds differ from the script)"))
+```
+
+```{r qc-violins, fig.height = 8}
+stages <- c("Before filtering", "After filtering")
+metrics <- c("nFeature_RNA", "log10_nCount_RNA", "percent_mt")
+
+qc_long <- bind_rows(mutate(qc, stage = stages[1]), mutate(qc_after, stage = stages[2])) %>%
+  mutate(stage = factor(stage, levels = stages),
+         group = coalesce(donor, snp_status),
+         log10_nCount_RNA = log10(nCount_RNA)) %>%
+  select(stage, group, all_of(metrics)) %>%
+  pivot_longer(all_of(metrics), names_to = "metric", values_to = "value") %>%
+  mutate(metric = factor(metric, levels = metrics))
+
+thr <- tibble(stage = factor(stages[1], levels = stages),
+              metric = factor(c("nFeature_RNA", "nFeature_RNA", "log10_nCount_RNA", "percent_mt"), levels = metrics),
+              value = c(min_features, max_features, log10(min_counts), max_mt))
+
+ggplot(qc_long, aes(group, value, fill = group)) +
+  geom_violin(scale = "width", linewidth = 0.3) +
+  geom_hline(data = thr, aes(yintercept = value), linetype = 2, colour = "red") +
+  facet_grid(metric ~ stage, scales = "free_y") +
+  labs(x = NULL, y = NULL, caption = "Groups: donor, or Demuxalot status for barcodes without a donor (doublets etc.)") +
+  theme_bw() + theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+# 1. TCR clonotypes: count and frequency
+
+**Primary analysis:** Paired nucleotide CDR3 (TRA|TRB) clonotypes from productive, high-confidence contigs in QC-passing Demuxalot singlets with exactly one distinct productive TRA and one distinct productive TRB. Counts and frequencies are calculated **within each donor**, without discarding clonotypes found in both donors. Frequencies use all eligible paired-TCR cells for that donor as the denominator. These frequencies are **not** percentages of all captured cells.
+
+**Sensitivity analysis:** Restrict the same paired-TCR population to SingleR-predicted T-cell lineages. This assesses whether unexpected non-T annotations materially change the repertoire. SingleR is a prediction, so unexpected labels should also be examined with marker expression.
+
+Shared clonotypes are **flagged, not removed**. A shared paired nucleotide clonotype may reflect true biological sharing, contamination, or assignment errors; donor imbalance alone does not establish its cause. Cells with multiple TRA/TRB chains are excluded from this *conservative paired-clonotype definition* and evaluated separately in the multiple-TRB section.
+
+```{r clonotypes}
+tcr_cells <- rd("TCR_paired_cell_level.tsv") %>%
+  dplyr::mutate(lineage = lineage(SingleR_fine))
+comp <- rd("celltype_composition_by_donor.tsv") %>%
+  dplyr::mutate(lineage = lineage(SingleR_fine))
+
+# Primary: all QC-passing Demuxalot singlets with eligible paired TCR.
+primary_counts <- tcr_cells %>%
+  dplyr::count(donor, clonotype, name = "cell_count")
+
+# Mark clonotypes occurring in more than one donor; do not reassign them.
+shared_flags <- primary_counts %>%
+  dplyr::group_by(clonotype) %>%
+  dplyr::summarise(n_donors = dplyr::n_distinct(donor),
+                   shared_between_donors = n_donors > 1, .groups = "drop")
+
+freq <- primary_counts %>%
+  dplyr::left_join(shared_flags, by = "clonotype") %>%
+  dplyr::group_by(donor) %>%
+  dplyr::mutate(denominator_paired_TCR_cells = sum(cell_count),
+                frequency_pct = 100 * cell_count / denominator_paired_TCR_cells) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(clonotype_aa = clono_aa(clonotype)) %>%
+  dplyr::arrange(donor, dplyr::desc(cell_count))
+
+readr::write_tsv(
+  freq %>% dplyr::select(donor, clonotype_aa, clonotype_nt = clonotype,
+                         cell_count, denominator_paired_TCR_cells,
+                         frequency_pct, shared_between_donors, n_donors),
+  file.path(analysis_dir, "TCR_clonotypes_primary_by_donor.tsv"))
+
+# Sensitivity: SingleR T-lineage cells only, without donor reassignment.
+t_cells <- tcr_cells %>% dplyr::filter(lineage %in% t_lineages)
+sensitivity <- t_cells %>%
+  dplyr::count(donor, clonotype, name = "cell_count") %>%
+  dplyr::left_join(shared_flags, by = "clonotype") %>%
+  dplyr::group_by(donor) %>%
+  dplyr::mutate(denominator_T_lineage_paired_cells = sum(cell_count),
+                frequency_pct = 100 * cell_count / denominator_T_lineage_paired_cells) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(clonotype_aa = clono_aa(clonotype)) %>%
+  dplyr::arrange(donor, dplyr::desc(cell_count))
+
+readr::write_tsv(
+  sensitivity %>% dplyr::select(donor, clonotype_aa, clonotype_nt = clonotype,
+                                 cell_count, denominator_T_lineage_paired_cells,
+                                 frequency_pct, shared_between_donors),
+  file.path(analysis_dir, "TCR_clonotypes_Tlineage_sensitivity.tsv"))
+
+# Explicit accounting of the paired-TCR population by donor.
+paired_summary <- tcr_cells %>%
+  dplyr::group_by(donor) %>%
+  dplyr::summarise(paired_TCR_cells = dplyr::n(),
+                   SingleR_T_lineage = sum(lineage %in% t_lineages),
+                   SingleR_non_T_or_other = sum(!lineage %in% t_lineages),
+                   .groups = "drop") %>%
+  dplyr::left_join(
+    comp %>% dplyr::filter(lineage %in% t_lineages) %>%
+      dplyr::group_by(donor) %>%
+      dplyr::summarise(T_lineage_cells_total = sum(n_cells), .groups = "drop"),
+    by = "donor") %>%
+  dplyr::mutate(pct_T_lineage_with_paired_TCR =
+                  100 * SingleR_T_lineage / T_lineage_cells_total)
+
+kab(paired_summary, caption = "Paired-TCR cell accounting; primary analysis retains all paired-TCR cells")
+
+shared_summary <- freq %>%
+  dplyr::filter(shared_between_donors) %>%
+  dplyr::select(clonotype_nt = clonotype, donor, cell_count) %>%
+  tidyr::pivot_wider(names_from = donor, values_from = cell_count, values_fill = 0)
+# Shared clonotypes remain in the analysis but are not displayed in the report.
+```
+
+## Why do some T cells not have a usable paired TCR?
+
+A cell without a usable **one-TRA + one-TRB** pair is **not necessarily an unpaired T cell**. It may have only one chain detected, neither chain detected, or more than one distinct productive chain. The categories below use **productive, high-confidence contigs with a nucleotide CDR3**, matching the analysis script. Multiple contigs with the same chain and CDR3 are counted as **one distinct chain**.
+
+The denominator is **all QC-passing Demuxalot singlets labeled as T lineage by SingleR**, not all GEX barcodes. Categories are mutually exclusive and add up to 100% for each donor.
+
+```{r tcr-chain-recovery}
+# The analysis script already exports n_TRA and n_TRB for every Demuxalot barcode.
+# Join those chain counts to the QC-passing cell list and SingleR lineage.
+chain_counts <- rd("TRB_chain_counts_all_demux_cells.tsv") %>%
+  dplyr::select(barcode, n_TRA, n_TRB) %>%
+  dplyr::distinct(barcode, .keep_all = TRUE)
+
+# The analysed Seurat metadata, if present, gives exact QC-passing cell barcodes
+# and SingleR predictions; use it rather than treating all SNP singlets as QC-passing.
+if (!file.exists(rds_file)) {
+  cat("**Chain recovery breakdown unavailable:** the saved Seurat RDS is needed to identify\n",
+      "the QC-passing SingleR T-lineage cells. The chain counts alone do not\n",
+      "provide those annotations. Expected: ", rds_file, "\n", sep = "")
+} else {
+  seu_chain <- readRDS(rds_file)
+  meta_chain <- seu_chain@meta.data %>%
+    tibble::rownames_to_column("barcode") %>%
+    dplyr::mutate(lineage = lineage(SingleR_fine)) %>%
+    dplyr::filter(lineage %in% t_lineages, !is.na(donor)) %>%
+    dplyr::select(barcode, donor, lineage)
+
+  chain_detail <- meta_chain %>%
+    dplyr::left_join(chain_counts, by = "barcode") %>%
+    dplyr::mutate(
+      n_TRA = tidyr::replace_na(n_TRA, 0L),
+      n_TRB = tidyr::replace_na(n_TRB, 0L),
+      chain_category = dplyr::case_when(
+        n_TRA == 0 & n_TRB == 0 ~ "Neither TRA nor TRB detected",
+        n_TRA >= 1 & n_TRB == 0 ~ "TRA only",
+        n_TRA == 0 & n_TRB >= 1 ~ "TRB only",
+        n_TRA == 1 & n_TRB == 1 ~ "Exactly 1 TRA + 1 TRB",
+        n_TRA > 1 & n_TRB == 1 ~ "Multiple TRA; 1 TRB",
+        n_TRA == 1 & n_TRB > 1 ~ "1 TRA; multiple TRB",
+        n_TRA > 1 & n_TRB > 1 ~ "Multiple TRA and TRB"
+      )
+    )
+
+  category_order <- c("Neither TRA nor TRB detected", "TRA only", "TRB only",
+                      "Exactly 1 TRA + 1 TRB", "Multiple TRA; 1 TRB",
+                      "1 TRA; multiple TRB", "Multiple TRA and TRB")
+  chain_summary <- chain_detail %>%
+    dplyr::count(donor, chain_category, name = "cells") %>%
+    tidyr::complete(donor, chain_category = category_order, fill = list(cells = 0L)) %>%
+    dplyr::group_by(donor) %>%
+    dplyr::mutate(total_SingleR_T_cells = sum(cells),
+                  pct_of_T_cells = 100 * cells / total_SingleR_T_cells) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(chain_category = factor(chain_category, levels = category_order)) %>%
+    dplyr::arrange(donor, chain_category)
+
+  readr::write_tsv(chain_detail,
+    file.path(analysis_dir, "TCR_chain_recovery_cell_level.tsv"))
+  readr::write_tsv(chain_summary,
+    file.path(analysis_dir, "TCR_chain_recovery_by_donor.tsv"))
+  kab(chain_summary, caption = "TCR chain recovery among QC-passing SingleR T-lineage cells")
+
+  # Cross-check against the paired-TCR summary above.
+  check <- chain_detail %>%
+    dplyr::group_by(donor) %>%
+    dplyr::summarise(exact_pairs_from_chain_counts = sum(n_TRA == 1 & n_TRB == 1),
+                     .groups = "drop") %>%
+    dplyr::left_join(paired_summary %>%
+      dplyr::select(donor, SingleR_T_lineage), by = "donor")
+  if (any(check$exact_pairs_from_chain_counts != check$SingleR_T_lineage)) {
+    warning("Paired counts differ from the original summary; check VDJ and QC barcode alignment.")
+  }
+
+  ggplot2::ggplot(chain_summary,
+    ggplot2::aes(x = donor, y = pct_of_T_cells, fill = chain_category)) +
+    ggplot2::geom_col() +
+    ggplot2::labs(title = "Why T cells lack a strict paired TRA/TRB",
+                  x = "Donor", y = "% of SingleR T-lineage cells",
+                  fill = "TCR chain status") +
+    ggplot2::theme_bw()
+}
+```
+
+**How to interpret this:** “TRA only” and “TRB only” are truly single-chain detections under these filters. “Neither” means no qualifying TRA/TRB sequence was detected, **not** that the cell lacks a TCR biologically. The multiple-chain groups contain cells excluded by the strict pairing definition, even though some may be genuine T cells. A single-cell RNA expression annotation does not prove the VDJ capture succeeded.
+
+## Top clonotypes per donor
+
+```{r top-table}
+freq %>%
+  dplyr::group_by(donor) %>%
+  dplyr::slice_max(cell_count, n = top_n, with_ties = FALSE) %>%
+  dplyr::arrange(dplyr::desc(cell_count), .by_group = TRUE) %>%
+  dplyr::mutate(rank = dplyr::row_number()) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(donor, rank, clonotype_aa, cell_count, frequency_pct,
+                shared_between_donors) %>%
+  kab()
+```
+
+```{r top-plot}
+freq %>%
+  dplyr::group_by(donor) %>%
+  dplyr::slice_max(cell_count, n = 20, with_ties = FALSE) %>%
+  dplyr::arrange(dplyr::desc(cell_count), .by_group = TRUE) %>%
+  dplyr::mutate(rank = dplyr::row_number()) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(rank, frequency_pct, fill = donor)) +
+  geom_col() + facet_wrap(~donor) +
+  labs(title = "Top 20 paired TRA/TRB clonotypes (Demuxalot singlets)",
+       x = "Clonotype rank", y = "Frequency among eligible paired-TCR cells (%)") +
+  theme_bw() + theme(legend.position = "none")
+```
+
+## Overall clonality
+
+```{r clonality}
+freq %>%
+  dplyr::group_by(donor) %>%
+  dplyr::summarise(
+    paired_TCR_cells = sum(cell_count),
+    n_clonotypes = dplyr::n(),
+    singleton_clonotypes = sum(cell_count == 1),
+    pct_cells_in_expanded_clones = 100 * sum(cell_count[cell_count >= 2]) / sum(cell_count),
+    top_clone_pct = 100 * max(cell_count) / sum(cell_count),
+    n_shared_clonotypes = sum(shared_between_donors),
+    .groups = "drop") %>%
+  kab()
+```
+
+The primary full clonotype table is saved to `ANALYSIS/TCR_clonotypes_primary_by_donor.tsv`. The T-lineage-only sensitivity table is saved separately as `ANALYSIS/TCR_clonotypes_Tlineage_sensitivity.tsv`.
+
+# 2. Cell-type breakdown
+
+Cell types are SingleR (Monaco reference, fine labels) collapsed into lineages, for QC-passing Demuxalot singlets. T lineage = CD8 T + CD4 T + MAIT/γδ labels.
+
+```{r celltypes}
+lin <- bind_rows(
+  comp %>% group_by(donor, lineage) %>% summarise(n_cells = sum(n_cells), .groups = "drop"),
+  comp %>% group_by(lineage) %>% summarise(n_cells = sum(n_cells), .groups = "drop") %>%
+    mutate(donor = "All donors")) %>%
+  group_by(donor) %>% mutate(pct = 100 * n_cells / sum(n_cells)) %>% ungroup()
+
+ggplot(lin, aes(donor, pct, fill = lineage)) +
+  geom_col() + labs(x = NULL, y = "% of cells") + theme_bw()
+
+lin %>% arrange(donor, desc(pct)) %>% kab(caption = "Lineage composition")
+
+lin %>% group_by(donor) %>%
+  summarise(cells = sum(n_cells),
+            pct_T_lineage = sum(pct[lineage %in% t_lineages]),
+            pct_CD8_T_label = sum(pct[lineage == "CD8 T"]),
+            pct_non_T = sum(pct[!lineage %in% t_lineages]), .groups = "drop") %>%
+  kab(caption = "Purity summary")
+```
+
+```{r fine-labels}
+comp %>%
+  group_by(SingleR_fine, lineage) %>% summarise(n_cells = sum(n_cells), .groups = "drop") %>%
+  mutate(pct = 100 * n_cells / sum(n_cells)) %>%
+  arrange(desc(n_cells)) %>% head(15) %>%
+  kab(caption = "Top 15 SingleR fine labels, all donors")
+```
+
+## UMAP
+
+UMAP of the analysed cells colored by SingleR lineage and by donor. When the `harmony` package is installed, Harmony is used only to compute the UMAP coordinates, so the two donors are drawn on a common layout. It changes nothing else: the lineages, clonotypes, and every table above come from the uncorrected data. Without `harmony` the original UMAP is drawn. This section needs the saved Seurat object and is skipped if it is missing.
+
+```{r umap, eval = file.exists(rds_file), fig.width = 12, fig.height = 5}
+suppressPackageStartupMessages(library(Seurat))
+seu <- readRDS(rds_file)
+seu$lineage <- lineage(seu$SingleR_fine)
+
+if (requireNamespace("harmony", quietly = TRUE)) {
+  set.seed(42)
+  seu <- harmony::RunHarmony(seu, group.by.vars = "donor", reduction.use = "pca",
+                             dims.use = 1:20, verbose = FALSE)
+  seu <- RunUMAP(seu, reduction = "harmony", dims = 1:20,
+                 reduction.name = "umap_harmony", reduction.key = "UMAPH_",
+                 seed.use = 42, verbose = FALSE)
+}
+red <- if ("umap_harmony" %in% names(seu@reductions)) "umap_harmony" else "umap"
+cat("UMAP coordinates used:", red, "\n")
+
+DimPlot(seu, reduction = red, group.by = "lineage", label = TRUE, repel = TRUE) +
+  ggtitle("Cell type (SingleR lineage)")
+DimPlot(seu, reduction = red, group.by = "donor", shuffle = TRUE) + ggtitle("Donor")
+```
